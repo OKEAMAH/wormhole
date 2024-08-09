@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"encoding/hex"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/certusone/wormhole/node/pkg/db"
@@ -103,8 +104,13 @@ type Processor struct {
 	msgC <-chan *common.MessagePublication
 	// setC is a channel of guardian set updates
 	setC <-chan *common.GuardianSet
-	// gossipSendC is a channel of outbound messages to broadcast on p2p
-	gossipSendC chan<- []byte
+
+	// gossipAttestationSendC is a channel of outbound observation messages to broadcast on p2p
+	gossipAttestationSendC chan<- []byte
+
+	// gossipVaaSendC is a channel of outbound VAA messages to broadcast on p2p
+	gossipVaaSendC chan<- []byte
+
 	// obsvC is a channel of inbound decoded observations from p2p
 	obsvC chan *common.MsgWithTimeStamp[gossipv1.SignedObservation]
 
@@ -139,6 +145,14 @@ type Processor struct {
 	acctReadC      <-chan *common.MessagePublication
 	pythnetVaas    map[string]PythNetVaaEntry
 	gatewayRelayer *gwrelayer.GatewayRelayer
+	updateVAALock  sync.Mutex
+	updatedVAAs    map[string]*updateVaaEntry
+}
+
+// updateVaaEntry is used to queue up a VAA to be written to the database.
+type updateVaaEntry struct {
+	v     *vaa.VAA
+	dirty bool
 }
 
 var (
@@ -155,6 +169,20 @@ var (
 			Help:    "Latency histogram for total time to process signed observations",
 			Buckets: []float64{10.0, 20.0, 50.0, 100.0, 1000.0, 5000.0, 10_000.0, 100_000.0, 1_000_000.0, 10_000_000.0, 100_000_000.0, 1_000_000_000.0},
 		})
+
+	timeToHandleObservation = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "wormhole_time_to_handle_observation_us",
+			Help:    "Latency histogram for total time to handle observation on an observation",
+			Buckets: []float64{10.0, 20.0, 50.0, 100.0, 1000.0, 5000.0, 10_000.0, 100_000.0, 1_000_000.0, 10_000_000.0, 100_000_000.0, 1_000_000_000.0},
+		})
+
+	timeToHandleQuorum = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "wormhole_time_to_handle_quorum_us",
+			Help:    "Latency histogram for total time to handle quorum on an observation",
+			Buckets: []float64{10.0, 20.0, 50.0, 100.0, 1000.0, 5000.0, 10_000.0, 100_000.0, 1_000_000.0, 10_000_000.0, 100_000_000.0, 1_000_000_000.0},
+		})
 )
 
 func NewProcessor(
@@ -162,7 +190,8 @@ func NewProcessor(
 	db *db.Database,
 	msgC <-chan *common.MessagePublication,
 	setC <-chan *common.GuardianSet,
-	gossipSendC chan<- []byte,
+	gossipAttestationSendC chan<- []byte,
+	gossipVaaSendC chan<- []byte,
 	obsvC chan *common.MsgWithTimeStamp[gossipv1.SignedObservation],
 	obsvReqSendC chan<- *gossipv1.ObservationRequest,
 	signedInC <-chan *gossipv1.SignedVAAWithQuorum,
@@ -175,15 +204,16 @@ func NewProcessor(
 ) *Processor {
 
 	return &Processor{
-		msgC:         msgC,
-		setC:         setC,
-		gossipSendC:  gossipSendC,
-		obsvC:        obsvC,
-		obsvReqSendC: obsvReqSendC,
-		signedInC:    signedInC,
-		gk:           gk,
-		gst:          gst,
-		db:           db,
+		msgC:                   msgC,
+		setC:                   setC,
+		gossipAttestationSendC: gossipAttestationSendC,
+		gossipVaaSendC:         gossipVaaSendC,
+		obsvC:                  obsvC,
+		obsvReqSendC:           obsvReqSendC,
+		signedInC:              signedInC,
+		gk:                     gk,
+		gst:                    gst,
+		db:                     db,
 
 		logger:         supervisor.Logger(ctx),
 		state:          &aggregationState{observationMap{}},
@@ -193,10 +223,15 @@ func NewProcessor(
 		acctReadC:      acctReadC,
 		pythnetVaas:    make(map[string]PythNetVaaEntry),
 		gatewayRelayer: gatewayRelayer,
+		updatedVAAs:    make(map[string]*updateVaaEntry),
 	}
 }
 
 func (p *Processor) Run(ctx context.Context) error {
+	if err := supervisor.Run(ctx, "vaaWriter", common.WrapWithScissors(p.vaaWriter, "vaaWriter")); err != nil {
+		return fmt.Errorf("failed to start vaa writer: %w", err)
+	}
+
 	cleanup := time.NewTicker(CleanupInterval)
 
 	// Always initialize the timer so don't have a nil pointer in the case below. It won't get rearmed after that.
@@ -254,9 +289,9 @@ func (p *Processor) Run(ctx context.Context) error {
 			p.handleMessage(k)
 		case m := <-p.obsvC:
 			observationChanDelay.Observe(float64(time.Since(m.Timestamp).Microseconds()))
-			p.handleObservation(ctx, m)
+			p.handleObservation(m)
 		case m := <-p.signedInC:
-			p.handleInboundSignedVAAWithQuorum(ctx, m)
+			p.handleInboundSignedVAAWithQuorum(m)
 		case <-cleanup.C:
 			p.handleCleanup(ctx)
 		case <-govTimer.C:
@@ -293,13 +328,17 @@ func (p *Processor) Run(ctx context.Context) error {
 	}
 }
 
-func (p *Processor) storeSignedVAA(v *vaa.VAA) error {
+// storeSignedVAA schedules a database update for a VAA.
+func (p *Processor) storeSignedVAA(v *vaa.VAA) {
 	if v.EmitterChain == vaa.ChainIDPythNet {
 		key := fmt.Sprintf("%v/%v", v.EmitterAddress, v.Sequence)
 		p.pythnetVaas[key] = PythNetVaaEntry{v: v, updateTime: time.Now()}
-		return nil
+		return
 	}
-	return p.db.StoreSignedVAA(v)
+	key := fmt.Sprintf("%d/%v/%v", v.EmitterChain, v.EmitterAddress, v.Sequence)
+	p.updateVAALock.Lock()
+	p.updatedVAAs[key] = &updateVaaEntry{v: v, dirty: true}
+	p.updateVAALock.Unlock()
 }
 
 // haveSignedVAA returns true if we already have a VAA for the given VAAID
@@ -313,12 +352,16 @@ func (p *Processor) haveSignedVAA(id db.VAAID) bool {
 		return exists
 	}
 
+	key := fmt.Sprintf("%d/%v/%v", id.EmitterChain, id.EmitterAddress, id.Sequence)
+	if p.getVaaFromUpdateMap(key) != nil {
+		return true
+	}
+
 	if p.db == nil {
 		return false
 	}
 
 	ok, err := p.db.HasVAA(id)
-
 	if err != nil {
 		p.logger.Error("failed to look up VAA in database",
 			zap.String("vaaID", string(id.Bytes())),
@@ -328,4 +371,61 @@ func (p *Processor) haveSignedVAA(id db.VAAID) bool {
 	}
 
 	return ok
+}
+
+// getVaaFromUpdateMap gets the VAA from the local map. If it's not there, it returns nil.
+func (p *Processor) getVaaFromUpdateMap(key string) *vaa.VAA {
+	p.updateVAALock.Lock()
+	entry, exists := p.updatedVAAs[key]
+	p.updateVAALock.Unlock()
+	if !exists {
+		return nil
+	}
+	return entry.v
+}
+
+// vaaWriter is the routine that writes VAAs to the database once per second. It creates a local copy of the map
+// being used by the processor to reduce lock contention. It uses a dirty flag to handle the case where the VAA
+// gets updated again while we are in the process of writing it to the database.
+func (p *Processor) vaaWriter(ctx context.Context) error {
+	ticker := time.NewTicker(time.Second)
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			var updatedVAAs map[string]*updateVaaEntry
+			p.updateVAALock.Lock()
+			if len(p.updatedVAAs) != 0 {
+				// There's something to write. Create a local copy of the map so we can release the lock.
+				updatedVAAs = make(map[string]*updateVaaEntry)
+				for key, entry := range p.updatedVAAs {
+					updatedVAAs[key] = entry
+					entry.dirty = false
+				}
+			}
+			p.updateVAALock.Unlock()
+			if updatedVAAs != nil {
+				// If there's anything to write, do that.
+				vaaBatch := make([]*vaa.VAA, 0, len(updatedVAAs))
+				for _, entry := range updatedVAAs {
+					vaaBatch = append(vaaBatch, entry.v)
+				}
+
+				if err := p.db.StoreSignedVAABatch(vaaBatch); err != nil {
+					p.logger.Error("failed to write VAAs to database", zap.Int("numVAAs", len(vaaBatch)), zap.Error(err))
+				}
+
+				// Go through the map and delete anything we have written that hasn't been updated again.
+				// If something has been updated again, it will get written next interval.
+				p.updateVAALock.Lock()
+				for key, entry := range p.updatedVAAs {
+					if !entry.dirty {
+						delete(p.updatedVAAs, key)
+					}
+				}
+				p.updateVAALock.Unlock()
+			}
+		}
+	}
 }
