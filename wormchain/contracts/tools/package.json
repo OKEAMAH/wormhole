@@ -19,10 +19,10 @@
     "@wormhole-foundation/wormchain-sdk": "file:../../ts-sdk",
     "cosmwasm": "1.1.1",
     "dotenv": "16.0.3",
-    "elliptic": "6.5.4",
-    "ethers": "5.7.2",
+    "elliptic": "6.5.7",
+    "ethers": "6.0.0",
     "js-sha3": "0.8.0",
-    "web3-eth-abi": "1.8.1",
+    "web3-eth-abi": "4.1.3",
     "yargs": "17.6.2"
   },
   "devDependencies": {
