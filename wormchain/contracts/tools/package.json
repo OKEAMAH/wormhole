@@ -14,7 +14,7 @@
   "author": "",
   "dependencies": {
     "@certusone/wormhole-sdk": "0.10.10",
-    "@cosmjs/cosmwasm-stargate": "0.29.5",
+    "@cosmjs/cosmwasm-stargate": "0.32.0",
     "@improbable-eng/grpc-web-node-http-transport": "0.15.0",
     "@wormhole-foundation/wormchain-sdk": "file:../../ts-sdk",
     "cosmwasm": "1.1.1",
@@ -22,7 +22,7 @@
     "elliptic": "6.5.4",
     "ethers": "5.7.2",
     "js-sha3": "0.8.0",
-    "web3-eth-abi": "1.8.1",
+    "web3-eth-abi": "1.10.1",
     "yargs": "17.6.2"
   },
   "devDependencies": {
