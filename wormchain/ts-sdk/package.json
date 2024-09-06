@@ -22,12 +22,12 @@
   },
   "homepage": "https://github.com/wormhole-foundation/wormchain#readme",
   "dependencies": {
-    "@certusone/wormhole-sdk": "^0.2.0",
+    "@certusone/wormhole-sdk": "^0.9.0",
     "@cosmjs/cosmwasm-stargate": "^0.32.0",
     "@cosmjs/launchpad": "^0.27.1",
     "@cosmjs/math": "^0.27.1",
     "@cosmjs/proto-signing": "^0.27.1",
-    "@cosmjs/stargate": "^0.27.1",
+    "@cosmjs/stargate": "^0.32.0",
     "@cosmjs/tendermint-rpc": "^0.32.0",
     "axios": "^0.26.0",
     "bech32": "^2.0.0",
@@ -36,7 +36,7 @@
     "keccak256": "^1.0.6",
     "node-fetch": "^2.6.7",
     "protobufjs": "^6.11.2",
-    "ts-jest": "^27.1.3",
+    "ts-jest": "^29.1.1",
     "tslint": "^6.1.3",
     "typescript": "^4.5.5"
   },
