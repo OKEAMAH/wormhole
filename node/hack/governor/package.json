@@ -30,7 +30,7 @@
     "@mysten/sui.js": "^0.32.2",
     "@solana/spl-token": "^0.1.8",
     "@solana/web3.js": "^1.24.0",
-    "@terra-money/terra.js": "^2.0.14",
+    "@terra-money/terra.js": "^3.0.10",
     "body-parser": "^1.19.0",
     "cors": "^2.8.5",
     "dotenv": "^10.0.0",
